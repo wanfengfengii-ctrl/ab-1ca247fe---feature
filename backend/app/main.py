@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -93,11 +93,92 @@ def _serialize_solution(
     }
 
 
+def _serialize_drift_solution(
+    sol: engine.DriftSolution,
+    stream_a: list[tuple[int, str]],
+    stream_b: list[tuple[int, str]],
+) -> dict[str, Any]:
+    """缓变校时方案：逐对给出实际偏移及相对上一对的变化，供判定漂移是否连续。"""
+    pairs_out: list[dict[str, Any]] = []
+    prev: Optional[int] = None
+    for (i, j), off in zip(sol.sequence, sol.offsets):
+        ta, ca = stream_a[i]
+        tb, cb = stream_b[j]
+        pairs_out.append(
+            {
+                "index_a": i,
+                "index_b": j,
+                "time_a": ta,
+                "time_b": tb,
+                "code": ca,
+                "offset": off,
+                "offset_change": None if prev is None else off - prev,
+            }
+        )
+        prev = off
+    return {
+        "initial_offset": sol.initial_offset,
+        "matched_count": sol.matched_count,
+        "pairs": pairs_out,
+    }
+
+
 @app.post("/api/adjudicate")
 def adjudicate(req: AdjudicateRequest) -> JSONResponse:
     stream_a = [(e.time, e.code) for e in req.stream_a.events]
     stream_b = [(e.time, e.code) for e in req.stream_b.events]
 
+    if req.drift_mode:
+        # —— 缓变校时模式：不使用固定跳变量 ——
+        assert req.max_drift is not None  # 请求校验已保证
+        result = engine.adjudicate_drift(
+            stream_a,
+            stream_b,
+            req.offset_min,
+            req.offset_max,
+            req.max_drift,
+            req.min_hits,
+        )
+        body: dict[str, Any] = {
+            "status": result.status,
+            "mode": "drift",
+            "matched_count": result.matched_count,
+            "min_hits": result.min_hits,
+            "uniqueness": result.uniqueness,
+            "solution": None,
+            "witness": None,
+            "reason": None,
+            "diagnostics": {
+                "pairs_evaluated": result.pairs_evaluated,
+                "max_drift": req.max_drift,
+            },
+            "drift_solution": None,
+            "drift_witness": None,
+        }
+        if result.status == "no_solution":
+            if result.matched_count == 0:
+                body["reason"] = "偏移范围内不存在任何同码配对"
+            else:
+                body["reason"] = (
+                    f"最大匹配数 {result.matched_count} 未达到最低命中数 {result.min_hits}"
+                )
+        else:
+            assert result.solution is not None
+            body["drift_solution"] = _serialize_drift_solution(
+                result.solution, stream_a, stream_b
+            )
+            if result.witness is not None:
+                body["drift_witness"] = _serialize_drift_solution(
+                    result.witness, stream_a, stream_b
+                )
+        # 经 schemas 再校验一遍，保证对外契约严格成立。
+        payload = schemas.AdjudicateResponse.model_validate(body).model_dump(
+            exclude_unset=True
+        )
+        return JSONResponse(payload)
+
+    # —— 静态偏移 / 单次跳变模式（行为与响应契约保持不变） ——
+    assert req.jump is not None  # 请求校验已保证
     result = engine.adjudicate(
         stream_a,
         stream_b,
@@ -107,7 +188,7 @@ def adjudicate(req: AdjudicateRequest) -> JSONResponse:
         req.min_hits,
     )
 
-    body: dict[str, Any] = {
+    body = {
         "status": result.status,
         "matched_count": result.matched_count,
         "min_hits": result.min_hits,
@@ -136,6 +217,9 @@ def adjudicate(req: AdjudicateRequest) -> JSONResponse:
                 result.witness, stream_a, stream_b, req.jump
             )
 
-    # 经 schemas 再校验一遍，保证对外契约严格成立。
-    payload = schemas.AdjudicateResponse.model_validate(body).model_dump()
+    # 经 schemas 再校验一遍，保证对外契约严格成立；exclude_unset 使响应
+    # 不携带本模式未使用的字段，静态模式响应与既有契约逐字节一致。
+    payload = schemas.AdjudicateResponse.model_validate(body).model_dump(
+        exclude_unset=True
+    )
     return JSONResponse(payload)

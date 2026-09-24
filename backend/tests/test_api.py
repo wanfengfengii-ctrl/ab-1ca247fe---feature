@@ -198,3 +198,174 @@ def test_ambiguous_response_contains_witness():
     assert out["uniqueness"] == "ambiguous"
     assert out["solution"]["initial_offset"] == 0
     assert out["witness"]["initial_offset"] == 100
+
+
+# ---------- 缓变校时（drift）模式 ----------
+
+
+def _drift_payload(**over):
+    body = {
+        "stream_a": {
+            "events": [
+                {"time": 0, "code": "TRIG"},
+                {"time": 100, "code": "U"},
+                {"time": 200, "code": "TRIG"},
+                {"time": 300, "code": "V"},
+            ]
+        },
+        "stream_b": {
+            "events": [
+                {"time": 5, "code": "TRIG"},
+                {"time": 103, "code": "U"},
+                {"time": 201, "code": "TRIG"},
+                {"time": 299, "code": "V"},
+            ]
+        },
+        "offset_min": -10,
+        "offset_max": 10,
+        "drift_mode": True,
+        "max_drift": 2,
+        "min_hits": 4,
+    }
+    body.update(over)
+    return body
+
+
+def test_drift_mode_contract():
+    r = client.post("/api/adjudicate", json=_drift_payload())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mode"] == "drift"
+    assert body["status"] == "optimal"
+    assert body["matched_count"] == 4
+    assert body["uniqueness"] == "unique"
+    assert body["solution"] is None and body["witness"] is None
+    sol = body["drift_solution"]
+    assert sol["initial_offset"] == -5
+    assert sol["matched_count"] == 4
+    # 逐对实际偏移与相对上一对的变化
+    assert [p["offset"] for p in sol["pairs"]] == [-5, -3, -1, 1]
+    assert [p["offset_change"] for p in sol["pairs"]] == [None, 2, 2, 2]
+    for p in sol["pairs"]:
+        assert p["time_a"] - p["time_b"] == p["offset"]
+    ia = [p["index_a"] for p in sol["pairs"]]
+    ib = [p["index_b"] for p in sol["pairs"]]
+    assert ia == sorted(ia) and len(set(ia)) == 4
+    assert ib == sorted(ib) and len(set(ib)) == 4
+    assert body["diagnostics"]["pairs_evaluated"] == 4
+    assert body["diagnostics"]["max_drift"] == 2
+
+
+def test_drift_mode_static_model_would_reject_same_data():
+    # 同一数据在单次跳变模型下最大匹配不足 → no_solution（兼容对照）
+    body = _drift_payload()
+    static_body = {
+        "stream_a": body["stream_a"],
+        "stream_b": body["stream_b"],
+        "offset_min": -10,
+        "offset_max": 10,
+        "jump": 2,
+        "min_hits": 4,
+    }
+    r = client.post("/api/adjudicate", json=static_body)
+    out = r.json()
+    assert out["status"] == "no_solution"
+    assert "mode" not in out and "drift_solution" not in out
+
+
+def test_drift_mode_requires_max_drift():
+    body = _drift_payload()
+    del body["max_drift"]
+    assert client.post("/api/adjudicate", json=body).status_code == 422
+
+
+def test_drift_mode_max_drift_bounds():
+    assert client.post("/api/adjudicate", json=_drift_payload(max_drift=-1)).status_code == 422
+    assert (
+        client.post("/api/adjudicate", json=_drift_payload(max_drift=2 * 10**12 + 1)).status_code
+        == 422
+    )
+    # 边界值合法
+    assert client.post("/api/adjudicate", json=_drift_payload(max_drift=0)).status_code == 200
+    assert (
+        client.post("/api/adjudicate", json=_drift_payload(max_drift=2 * 10**12)).status_code
+        == 200
+    )
+
+
+def test_drift_mode_ignores_jump_field():
+    # 缓变模式不再使用固定跳变量：不传 jump 即可裁决；传入亦被忽略
+    body = _drift_payload()
+    assert "jump" not in body
+    r1 = client.post("/api/adjudicate", json=body)
+    assert r1.status_code == 200
+    r2 = client.post("/api/adjudicate", json={**body, "jump": 7})
+    assert r2.status_code == 200
+    assert r2.json() == r1.json()
+
+
+def test_static_mode_requires_jump():
+    body = _drift_payload()
+    del body["drift_mode"]
+    del body["max_drift"]
+    assert client.post("/api/adjudicate", json=body).status_code == 422
+
+
+def test_static_mode_response_shape_unchanged():
+    # 关闭缓变模式时响应不携带任何新增字段
+    r = client.post("/api/adjudicate", json=_payload())
+    out = r.json()
+    assert set(out.keys()) == {
+        "status",
+        "matched_count",
+        "min_hits",
+        "uniqueness",
+        "solution",
+        "witness",
+        "reason",
+        "diagnostics",
+    }
+    # 显式 drift_mode=false 与省略完全等价
+    r2 = client.post("/api/adjudicate", json={**_payload(), "drift_mode": False})
+    assert r2.json() == out
+
+
+def test_drift_mode_ambiguous_witness():
+    body = _drift_payload(
+        stream_a={
+            "events": [
+                {"time": 0, "code": "A"},
+                {"time": 10, "code": "B"},
+                {"time": 200, "code": "C"},
+                {"time": 210, "code": "D"},
+            ]
+        },
+        stream_b={
+            "events": [
+                {"time": 0, "code": "A"},
+                {"time": 10, "code": "B"},
+                {"time": 100, "code": "C"},
+                {"time": 110, "code": "D"},
+            ]
+        },
+        offset_min=-200,
+        offset_max=200,
+        max_drift=5,
+        min_hits=1,
+    )
+    r = client.post("/api/adjudicate", json=body)
+    out = r.json()
+    assert out["status"] == "optimal"
+    assert out["uniqueness"] == "ambiguous"
+    assert out["drift_solution"]["initial_offset"] == 0
+    assert out["drift_witness"]["initial_offset"] == 100
+    assert out["drift_witness"]["matched_count"] == out["drift_solution"]["matched_count"]
+
+
+def test_drift_mode_no_solution_reason():
+    r = client.post("/api/adjudicate", json=_drift_payload(min_hits=5))
+    out = r.json()
+    assert out["status"] == "no_solution"
+    assert "最低命中数" in out["reason"]
+    assert out["drift_solution"] is None
+    assert out["mode"] == "drift"

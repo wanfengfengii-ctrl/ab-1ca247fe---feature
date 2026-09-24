@@ -46,13 +46,25 @@ class AdjudicateRequest(BaseModel):
     stream_b: StreamIn
     offset_min: int = Field(..., ge=-OFFSET_BOUND, le=OFFSET_BOUND)
     offset_max: int = Field(..., ge=-OFFSET_BOUND, le=OFFSET_BOUND)
-    jump: int = Field(..., ge=1, le=JUMP_MAX)
+    # 静态偏移 / 单次跳变模式必填；缓变校时模式下不再使用（传入亦被忽略）。
+    jump: Optional[int] = Field(None, ge=1, le=JUMP_MAX)
     min_hits: int = Field(..., ge=1, le=MIN_HITS_MAX)
+    # 缓变校时：启用后不再使用固定跳变量，改为约束每相邻已匹配事件的
+    # 整数偏移变化不超过 max_drift。
+    drift_mode: bool = False
+    max_drift: Optional[int] = Field(None, ge=0, le=JUMP_MAX)
 
     @model_validator(mode="after")
     def _check_ranges(self) -> "AdjudicateRequest":
         if self.offset_min > self.offset_max:
             raise ValueError("允许偏移范围下界不能大于上界")
+        if self.drift_mode:
+            if self.max_drift is None:
+                raise ValueError(
+                    "启用缓变校时时必须填写每相邻事件允许的最大整数偏移变化 max_drift"
+                )
+        elif self.jump is None:
+            raise ValueError("未启用缓变校时时必须填写固定跳变量 jump")
         return self
 
 
@@ -76,6 +88,22 @@ class SolutionOut(BaseModel):
     pairs: list[PairOut]
 
 
+class DriftPairOut(BaseModel):
+    index_a: int
+    index_b: int
+    time_a: int
+    time_b: int
+    code: str
+    offset: int  # 该对实际偏移 tA - tB
+    offset_change: Optional[int]  # 相对上一对偏移的变化；首对为 null
+
+
+class DriftSolutionOut(BaseModel):
+    initial_offset: int  # 首对偏移 d0
+    matched_count: int
+    pairs: list[DriftPairOut]
+
+
 class AdjudicateResponse(BaseModel):
     status: Literal["optimal", "no_solution"]
     matched_count: int
@@ -85,3 +113,7 @@ class AdjudicateResponse(BaseModel):
     witness: Optional[SolutionOut]
     reason: Optional[str]
     diagnostics: dict
+    # —— 缓变校时模式专用字段；静态模式响应不携带这些键（保持原有契约） ——
+    mode: Literal["jump", "drift"] = "jump"
+    drift_solution: Optional[DriftSolutionOut] = None
+    drift_witness: Optional[DriftSolutionOut] = None

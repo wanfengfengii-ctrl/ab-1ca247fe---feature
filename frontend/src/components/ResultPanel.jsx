@@ -26,6 +26,8 @@ export default function ResultPanel({ result, error }) {
     );
   }
 
+  const isDrift = result.mode === 'drift';
+
   if (result.status === 'no_solution') {
     return (
       <section className="card result">
@@ -44,9 +46,11 @@ export default function ResultPanel({ result, error }) {
             <dd>{result.min_hits}</dd>
           </div>
           <div>
-            <dt>评估偏移数 / 方案组</dt>
+            <dt>{isDrift ? '范围内同码配对数' : '评估偏移数 / 方案组'}</dt>
             <dd>
-              {result.diagnostics.offsets_evaluated} / {result.diagnostics.groups_evaluated}
+              {isDrift
+                ? result.diagnostics.pairs_evaluated
+                : `${result.diagnostics.offsets_evaluated} / ${result.diagnostics.groups_evaluated}`}
             </dd>
           </div>
         </dl>
@@ -55,11 +59,14 @@ export default function ResultPanel({ result, error }) {
   }
 
   const ambiguous = result.uniqueness === 'ambiguous';
-  const viewing = ambiguous && showWitness && result.witness ? result.witness : result.solution;
+  const solKey = isDrift ? 'drift_solution' : 'solution';
+  const witKey = isDrift ? 'drift_witness' : 'witness';
+  const viewing =
+    ambiguous && showWitness && result[witKey] ? result[witKey] : result[solKey];
   return (
     <section className="card result">
       <header className="card-head">
-        <h2>裁决结果</h2>
+        <h2>裁决结果{isDrift ? '（缓变校时）' : ''}</h2>
         <span className={`badge ${ambiguous ? 'badge-warn' : 'badge-ok'}`}>
           {ambiguous ? '歧义：存在同分方案' : '唯一规范首解'}
         </span>
@@ -84,8 +91,17 @@ export default function ResultPanel({ result, error }) {
         </div>
       )}
 
-      <SolutionSummary sol={viewing} />
-      <PairTable sol={viewing} />
+      {isDrift ? (
+        <>
+          <DriftSummary sol={viewing} maxDrift={result.diagnostics.max_drift} />
+          <DriftPairTable sol={viewing} maxDrift={result.diagnostics.max_drift} />
+        </>
+      ) : (
+        <>
+          <SolutionSummary sol={viewing} />
+          <PairTable sol={viewing} />
+        </>
+      )}
 
       <dl className="summary">
         <div>
@@ -95,9 +111,11 @@ export default function ResultPanel({ result, error }) {
           </dd>
         </div>
         <div>
-          <dt>评估偏移数 / 方案组</dt>
+          <dt>{isDrift ? '范围内同码配对数' : '评估偏移数 / 方案组'}</dt>
           <dd>
-            {result.diagnostics.offsets_evaluated} / {result.diagnostics.groups_evaluated}
+            {isDrift
+              ? result.diagnostics.pairs_evaluated
+              : `${result.diagnostics.offsets_evaluated} / ${result.diagnostics.groups_evaluated}`}
           </dd>
         </div>
       </dl>
@@ -182,6 +200,91 @@ function PairTable({ sol }) {
           {sol.jump_amount} → {sol.offset_after}。
         </p>
       )}
+    </div>
+  );
+}
+
+function DriftSummary({ sol, maxDrift }) {
+  const changes = sol.pairs
+    .map((p) => p.offset_change)
+    .filter((v) => v !== null && v !== undefined);
+  const maxChange = changes.length ? Math.max(...changes.map((v) => Math.abs(v))) : 0;
+  return (
+    <dl className="summary">
+      <div>
+        <dt>初始偏移 d（首对）</dt>
+        <dd>{sol.initial_offset}</dd>
+      </div>
+      <div>
+        <dt>总匹配数</dt>
+        <dd>{sol.matched_count}</dd>
+      </div>
+      <div>
+        <dt>相邻偏移最大变化</dt>
+        <dd>
+          {maxChange} / 上限 {maxDrift}
+        </dd>
+      </div>
+    </dl>
+  );
+}
+
+function DriftPairTable({ sol, maxDrift }) {
+  // 缓变校时逐对核对：实际偏移与相对上一对的变化，供判定漂移是否连续。
+  return (
+    <div className="table-wrap">
+      <table className="pair-table">
+        <thead>
+          <tr>
+            <th>对</th>
+            <th>A 索引</th>
+            <th>B 索引</th>
+            <th>时间 A</th>
+            <th>时间 B</th>
+            <th>事件码</th>
+            <th>该对偏移 tA−tB</th>
+            <th>较上一对变化</th>
+            <th>对时核对</th>
+          </tr>
+        </thead>
+        <tbody>
+          {sol.pairs.map((p, idx) => {
+            const aligned = p.time_a - p.time_b === p.offset;
+            const change = p.offset_change;
+            const changeCls =
+              change === null || change === undefined
+                ? ''
+                : change > 0
+                  ? 'change-pos'
+                  : change < 0
+                    ? 'change-neg'
+                    : 'change-zero';
+            return (
+              <tr key={idx}>
+                <td>{idx + 1}</td>
+                <td>{p.index_a}</td>
+                <td>{p.index_b}</td>
+                <td>{p.time_a}</td>
+                <td>{p.time_b}</td>
+                <td className="mono">{p.code}</td>
+                <td>{p.offset}</td>
+                <td className={changeCls}>
+                  {change === null || change === undefined
+                    ? '—（首对）'
+                    : change > 0
+                      ? `+${change}`
+                      : `${change}`}
+                </td>
+                <td>{aligned ? '✓ 完全相等' : '✗'}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p className="muted small">
+        每相邻两对的偏移变化均不超过上限 {maxDrift}；变化列为零表示两卡时钟保持同步，
+        连续同号变化即为单向漂移。
+      </p>
     </div>
   );
 }

@@ -28,6 +28,8 @@ export default function App() {
     offset_max: '50',
     jump: '100',
     min_hits: '2',
+    drift_mode: false,
+    max_drift: '2',
   });
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
@@ -47,9 +49,15 @@ export default function App() {
         stream_b: { events: normalize(streamB) },
         offset_min: Number(params.offset_min),
         offset_max: Number(params.offset_max),
-        jump: Number(params.jump),
         min_hits: Number(params.min_hits),
       };
+      if (params.drift_mode) {
+        // 缓变校时：不再使用固定跳变量，改用相邻偏移变化上限。
+        payload.drift_mode = true;
+        payload.max_drift = Number(params.max_drift);
+      } else {
+        payload.jump = Number(params.jump);
+      }
       const data = await adjudicate(payload);
       setResult(data);
     } catch (e) {
@@ -65,8 +73,8 @@ export default function App() {
       <header className="topbar">
         <h1>加速器束流事件流复核台</h1>
         <p className="subtitle">
-          双采集卡漏记脉冲 / 单次永久计数跳变的对时裁决：保持顺序、同码匹配、可跳事件，
-          最大化命中数并输出规范首解，歧义时附第二份见证。
+          双采集卡漏记脉冲 / 单次永久计数跳变 / 连续缓慢漂移的对时裁决：保持顺序、
+          同码匹配、可跳事件，最大化命中数并输出规范首解，歧义时附第二份见证。
         </p>
       </header>
 
@@ -116,15 +124,23 @@ function validStream(events) {
 }
 
 function validateParams(p) {
-  if (![p.offset_min, p.offset_max, p.jump, p.min_hits].every((v) => INT_RE.test(v)))
+  if (![p.offset_min, p.offset_max, p.min_hits].every((v) => INT_RE.test(v)))
     return false;
   const lo = Number(p.offset_min);
   const hi = Number(p.offset_max);
-  const j = Number(p.jump);
   const hits = Number(p.min_hits);
   if (lo > hi) return false;
   if (Math.abs(lo) > 10 ** 12 || Math.abs(hi) > 10 ** 12) return false;
-  if (j < 1 || j > 2 * 10 ** 12) return false;
   if (hits < 1 || hits > 80) return false;
+  if (p.drift_mode) {
+    // 缓变校时：每相邻已匹配事件的整数偏移变化上限，0 … 2·10¹²。
+    if (!INT_RE.test(p.max_drift)) return false;
+    const w = Number(p.max_drift);
+    if (w < 0 || w > 2 * 10 ** 12) return false;
+  } else {
+    if (!INT_RE.test(p.jump)) return false;
+    const j = Number(p.jump);
+    if (j < 1 || j > 2 * 10 ** 12) return false;
+  }
   return true;
 }
