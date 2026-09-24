@@ -300,6 +300,21 @@ textarea:focus {
 }
 
 /* ---------- 参数面板 ---------- */
+.mode-switch {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.sample-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -6px 0 16px;
+  flex-wrap: wrap;
+}
+
 .params-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

@@ -16,8 +16,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from . import engine, schemas
+from . import drift, engine, schemas
 from .schemas import (
+    DRIFT_CHANGE_MAX,
     EVENTS_MAX,
     EVENTS_MIN,
     JUMP_MAX,
@@ -52,6 +53,7 @@ def meta() -> dict[str, Any]:
         "events_min": EVENTS_MIN,
         "events_max": EVENTS_MAX,
         "jump_max": JUMP_MAX,
+        "drift_change_max": DRIFT_CHANGE_MAX,
         "code_pattern": "^[A-Z0-9]{1,8}$",
         "sign_order": ["none", "minus", "plus"],
     }
@@ -93,11 +95,45 @@ def _serialize_solution(
     }
 
 
+def _serialize_drift_solution(
+    sol: drift.DriftSolution,
+    stream_a: list[tuple[int, str]],
+    stream_b: list[tuple[int, str]],
+    max_change: int,
+) -> dict[str, Any]:
+    pairs_out: list[dict[str, Any]] = []
+    for pos, ((i, j), used_offset) in enumerate(zip(sol.sequence, sol.offsets)):
+        ta, ca = stream_a[i]
+        tb, cb = stream_b[j]
+        change = None if pos == 0 else used_offset - sol.offsets[pos - 1]
+        pairs_out.append(
+            {
+                "index_a": i,
+                "index_b": j,
+                "time_a": ta,
+                "time_b": tb,
+                "code": ca,
+                "offset": used_offset,
+                "offset_change": change,
+            }
+        )
+    return {
+        "initial_offset": sol.initial_offset,
+        "max_offset_change": max_change,
+        "matched_count": sol.matched_count,
+        "pairs": pairs_out,
+    }
+
+
 @app.post("/api/adjudicate")
 def adjudicate(req: AdjudicateRequest) -> JSONResponse:
     stream_a = [(e.time, e.code) for e in req.stream_a.events]
     stream_b = [(e.time, e.code) for e in req.stream_b.events]
 
+    if req.drift_mode:
+        return _adjudicate_drift(req, stream_a, stream_b)
+
+    assert req.jump is not None  # 模型校验已保证
     result = engine.adjudicate(
         stream_a,
         stream_b,
@@ -138,4 +174,55 @@ def adjudicate(req: AdjudicateRequest) -> JSONResponse:
 
     # 经 schemas 再校验一遍，保证对外契约严格成立。
     payload = schemas.AdjudicateResponse.model_validate(body).model_dump()
+    return JSONResponse(payload)
+
+
+def _adjudicate_drift(
+    req: AdjudicateRequest,
+    stream_a: list[tuple[int, str]],
+    stream_b: list[tuple[int, str]],
+) -> JSONResponse:
+    """缓变校时模式分支：不使用固定跳变量。"""
+    assert req.max_offset_change is not None  # 模型校验已保证
+    result = drift.adjudicate_drift(
+        stream_a,
+        stream_b,
+        req.offset_min,
+        req.offset_max,
+        req.max_offset_change,
+        req.min_hits,
+    )
+
+    body: dict[str, Any] = {
+        "status": result.status,
+        "matched_count": result.matched_count,
+        "min_hits": result.min_hits,
+        "uniqueness": result.uniqueness,
+        "solution": None,
+        "witness": None,
+        "reason": None,
+        "diagnostics": {
+            "offsets_evaluated": result.offsets_evaluated,
+            "candidates_evaluated": result.candidates_evaluated,
+        },
+    }
+
+    if result.status == "no_solution":
+        if result.matched_count == 0:
+            body["reason"] = "偏移范围内不存在任何同码配对"
+        else:
+            body["reason"] = (
+                f"最大匹配数 {result.matched_count} 未达到最低命中数 {result.min_hits}"
+            )
+    else:
+        assert result.solution is not None
+        body["solution"] = _serialize_drift_solution(
+            result.solution, stream_a, stream_b, req.max_offset_change
+        )
+        if result.witness is not None:
+            body["witness"] = _serialize_drift_solution(
+                result.witness, stream_a, stream_b, req.max_offset_change
+            )
+
+    payload = schemas.DriftAdjudicateResponse.model_validate(body).model_dump()
     return JSONResponse(payload)

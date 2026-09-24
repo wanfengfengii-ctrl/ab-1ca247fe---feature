@@ -2,6 +2,8 @@ import { useState } from 'react';
 
 const DIR_LABEL = { none: '无跳变', minus: '减 −J', plus: '加 +J' };
 
+const isDriftSol = (sol) => sol && Object.prototype.hasOwnProperty.call(sol, 'max_offset_change');
+
 // 裁决结果面板：概览 + 逐对核对表 + 歧义见证切换。
 export default function ResultPanel({ result, error }) {
   const [showWitness, setShowWitness] = useState(false);
@@ -43,12 +45,7 @@ export default function ResultPanel({ result, error }) {
             <dt>最低命中数</dt>
             <dd>{result.min_hits}</dd>
           </div>
-          <div>
-            <dt>评估偏移数 / 方案组</dt>
-            <dd>
-              {result.diagnostics.offsets_evaluated} / {result.diagnostics.groups_evaluated}
-            </dd>
-          </div>
+          <Diagnostics diag={result.diagnostics} />
         </dl>
       </section>
     );
@@ -56,6 +53,7 @@ export default function ResultPanel({ result, error }) {
 
   const ambiguous = result.uniqueness === 'ambiguous';
   const viewing = ambiguous && showWitness && result.witness ? result.witness : result.solution;
+  const drift = isDriftSol(viewing);
   return (
     <section className="card result">
       <header className="card-head">
@@ -84,8 +82,8 @@ export default function ResultPanel({ result, error }) {
         </div>
       )}
 
-      <SolutionSummary sol={viewing} />
-      <PairTable sol={viewing} />
+      {drift ? <DriftSolutionSummary sol={viewing} /> : <SolutionSummary sol={viewing} />}
+      {drift ? <DriftPairTable sol={viewing} /> : <PairTable sol={viewing} />}
 
       <dl className="summary">
         <div>
@@ -94,14 +92,22 @@ export default function ResultPanel({ result, error }) {
             {result.matched_count} / {result.min_hits}
           </dd>
         </div>
-        <div>
-          <dt>评估偏移数 / 方案组</dt>
-          <dd>
-            {result.diagnostics.offsets_evaluated} / {result.diagnostics.groups_evaluated}
-          </dd>
-        </div>
+        <Diagnostics diag={result.diagnostics} />
       </dl>
     </section>
+  );
+}
+
+function Diagnostics({ diag }) {
+  if (!diag) return null;
+  const drift = 'candidates_evaluated' in diag;
+  return (
+    <div>
+      <dt>{`评估偏移数 / ${drift ? '候选配对' : '方案组'}`}</dt>
+      <dd>
+        {diag.offsets_evaluated} / {drift ? diag.candidates_evaluated : diag.groups_evaluated}
+      </dd>
+    </div>
   );
 }
 
@@ -127,6 +133,25 @@ function SolutionSummary({ sol }) {
       <div>
         <dt>跳变前匹配数 k</dt>
         <dd>{sol.pairs_before_jump}</dd>
+      </div>
+      <div>
+        <dt>总匹配数</dt>
+        <dd>{sol.matched_count}</dd>
+      </div>
+    </dl>
+  );
+}
+
+function DriftSolutionSummary({ sol }) {
+  return (
+    <dl className="summary">
+      <div>
+        <dt>初始偏移 d（首对）</dt>
+        <dd>{sol.initial_offset}</dd>
+      </div>
+      <div>
+        <dt>相邻最大偏移变化</dt>
+        <dd>{sol.max_offset_change}</dd>
       </div>
       <div>
         <dt>总匹配数</dt>
@@ -182,6 +207,59 @@ function PairTable({ sol }) {
           {sol.jump_amount} → {sol.offset_after}。
         </p>
       )}
+    </div>
+  );
+}
+
+function formatChange(ch) {
+  if (ch === null || ch === undefined) return '—（首对）';
+  if (ch > 0) return `+${ch}`;
+  return String(ch);
+}
+
+function DriftPairTable({ sol }) {
+  // 缓变校时逐对核对：实际偏移 + 相对上一对的变化，判断漂移是否连续。
+  const limit = sol.max_offset_change;
+  return (
+    <div className="table-wrap">
+      <table className="pair-table">
+        <thead>
+          <tr>
+            <th>对</th>
+            <th>A 索引</th>
+            <th>B 索引</th>
+            <th>时间 A</th>
+            <th>时间 B</th>
+            <th>事件码</th>
+            <th>实际偏移 tA−tB</th>
+            <th>相对上一对变化</th>
+            <th>对时核对</th>
+          </tr>
+        </thead>
+        <tbody>
+          {sol.pairs.map((p, idx) => {
+            const aligned = p.time_a - p.time_b === p.offset;
+            const within = p.offset_change === null || Math.abs(p.offset_change) <= limit;
+            return (
+              <tr key={idx} className={within ? 'phase-before' : 'phase-after'}>
+                <td>{idx + 1}</td>
+                <td>{p.index_a}</td>
+                <td>{p.index_b}</td>
+                <td>{p.time_a}</td>
+                <td>{p.time_b}</td>
+                <td className="mono">{p.code}</td>
+                <td>{p.offset}</td>
+                <td>{formatChange(p.offset_change)}</td>
+                <td>{aligned && within ? '✓' : '✗'}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p className="muted small">
+        每对偏移均落在允许范围内，且相邻两对偏移之差的绝对值不超过 {limit}；
+        逐对查看变化即可判断漂移是否连续。
+      </p>
     </div>
   );
 }

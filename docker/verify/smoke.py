@@ -128,6 +128,165 @@ def main() -> int:
             (body.get("witness") or {}).get("initial_offset") == 100,
         )
 
+        print("== 静态模式响应契约保持不变（无 drift/mode 字段）==")
+        r = cli.post("/api/adjudicate", json=sample)
+        body = r.json()
+        check("响应不含 mode 字段", "mode" not in body)
+        sol = body.get("solution") or {}
+        check(
+            "solution 字段集合与旧契约一致",
+            set(sol.keys())
+            == {
+                "initial_offset",
+                "jump_direction",
+                "jump_amount",
+                "offset_after",
+                "pairs_before_jump",
+                "matched_count",
+                "pairs",
+            },
+            str(sorted(sol.keys())),
+        )
+        check(
+            "逐对字段集合与旧契约一致",
+            set(sol["pairs"][0].keys())
+            == {"index_a", "index_b", "time_a", "time_b", "code", "phase", "offset"},
+        )
+
+        # ---- 缓变校时（漂移）模式 ----
+        print("== POST 缓变校时：逐对偏移 -2,0,+2,+4（静态模型无法全中）==")
+        drift_sample = {
+            "stream_a": {
+                "events": [
+                    {"time": 0, "code": "A"},
+                    {"time": 10, "code": "B"},
+                    {"time": 20, "code": "C"},
+                    {"time": 30, "code": "D"},
+                ]
+            },
+            "stream_b": {
+                "events": [
+                    {"time": 2, "code": "A"},
+                    {"time": 10, "code": "B"},
+                    {"time": 18, "code": "C"},
+                    {"time": 26, "code": "D"},
+                ]
+            },
+            "offset_min": -10,
+            "offset_max": 10,
+            "drift_mode": True,
+            "max_offset_change": 2,
+            "min_hits": 2,
+        }
+        r = cli.post("/api/adjudicate", json=drift_sample)
+        check("drift 200", r.status_code == 200, str(r.status_code))
+        body = r.json()
+        sol = body.get("solution") or {}
+        pairs = sol.get("pairs", [])
+        check("drift 顶层 mode=drift", body.get("mode") == "drift")
+        check("drift optimal", body.get("status") == "optimal")
+        check("drift matched 4", body.get("matched_count") == 4, str(body.get("matched_count")))
+        check("drift unique", body.get("uniqueness") == "unique")
+        check("drift initial -2", sol.get("initial_offset") == -2)
+        check("drift max_offset_change 2", sol.get("max_offset_change") == 2)
+        check(
+            "drift 逐对实际偏移",
+            [p.get("offset") for p in pairs] == [-2, 0, 2, 4],
+        )
+        check(
+            "drift 相对上一对变化（首对 null）",
+            [p.get("offset_change") for p in pairs] == [None, 2, 2, 2],
+        )
+        check(
+            "drift 偏移等于真实时间差",
+            all(p["time_a"] - p["time_b"] == p["offset"] for p in pairs),
+        )
+        check("drift 不含跳变字段", "jump_direction" not in sol and "phase" not in pairs[0])
+        check(
+            "drift 诊断计数",
+            isinstance(body.get("diagnostics", {}).get("candidates_evaluated"), int),
+        )
+
+        print("== 同样数据在静态/一次跳变模型下被拒（对照）==")
+        static_equiv = {
+            **{k: v for k, v in drift_sample.items()
+               if k not in ("drift_mode", "max_offset_change")},
+            "jump": 100,
+            "min_hits": 2,
+        }
+        r = cli.post("/api/adjudicate", json=static_equiv)
+        body = r.json()
+        check(
+            "静态模型无解（最大仅 1 对）",
+            body.get("status") == "no_solution" and body.get("matched_count") == 1,
+            f"{body.get('status')}/{body.get('matched_count')}",
+        )
+
+        print("== 缓变校时失败边界：变化上限过小 ==")
+        r = cli.post(
+            "/api/adjudicate",
+            json={**drift_sample, "max_offset_change": 1, "min_hits": 2},
+        )
+        body = r.json()
+        check(
+            "上限 1 无解且给出最大匹配数",
+            body.get("status") == "no_solution" and body.get("matched_count") == 1,
+            f"{body.get('status')}/{body.get('matched_count')}",
+        )
+        r = cli.post(
+            "/api/adjudicate",
+            json={**drift_sample, "max_offset_change": 2, "min_hits": 5},
+        )
+        check("最低命中 5 无解", r.json().get("status") == "no_solution")
+
+        print("== 缓变校时输入校验 ==")
+        bad = {k: v for k, v in drift_sample.items() if k != "max_offset_change"}
+        r = cli.post("/api/adjudicate", json=bad)
+        check("缺少 max_offset_change → 422", r.status_code == 422, str(r.status_code))
+        r = cli.post(
+            "/api/adjudicate", json={**drift_sample, "max_offset_change": -1}
+        )
+        check("负的 max_offset_change → 422", r.status_code == 422, str(r.status_code))
+        no_jump = {k: v for k, v in static_equiv.items() if k != "jump"}
+        r = cli.post("/api/adjudicate", json=no_jump)
+        check("静态模式缺少 jump → 422", r.status_code == 422, str(r.status_code))
+
+        print("== 缓变校时歧义 → 附第二份见证（逐对变化）==")
+        drift_amb = {
+            "stream_a": {
+                "events": [
+                    {"time": 0, "code": "A"},
+                    {"time": 10, "code": "B"},
+                    {"time": 100, "code": "C"},
+                    {"time": 110, "code": "D"},
+                ]
+            },
+            "stream_b": {
+                "events": [
+                    {"time": 0, "code": "A"},
+                    {"time": 10, "code": "B"},
+                    {"time": 97, "code": "C"},
+                    {"time": 107, "code": "D"},
+                ]
+            },
+            "offset_min": -5,
+            "offset_max": 5,
+            "drift_mode": True,
+            "max_offset_change": 0,
+            "min_hits": 2,
+        }
+        r = cli.post("/api/adjudicate", json=drift_amb)
+        body = r.json()
+        check("drift ambiguous", body.get("uniqueness") == "ambiguous")
+        check("drift 首解 d=0", (body.get("solution") or {}).get("initial_offset") == 0)
+        witness = body.get("witness") or {}
+        check("drift 见证 d=3", witness.get("initial_offset") == 3)
+        check(
+            "见证逐对偏移与变化",
+            [p["offset"] for p in witness.get("pairs", [])] == [3, 3]
+            and [p["offset_change"] for p in witness.get("pairs", [])] == [None, 0],
+        )
+
     if failures:
         print(f"\n冒烟失败 {len(failures)} 项：{failures}", file=sys.stderr)
         return 1

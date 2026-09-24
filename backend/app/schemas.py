@@ -12,6 +12,7 @@ EVENTS_MIN = 2
 EVENTS_MAX = 80
 OFFSET_BOUND = TIME_MAX  # 时间差只可能落在 [-10^12, 10^12]
 JUMP_MAX = 2 * TIME_MAX
+DRIFT_CHANGE_MAX = 2 * TIME_MAX  # 相邻对偏移变化上限的最大取值
 MIN_HITS_MAX = EVENTS_MAX
 
 
@@ -46,13 +47,26 @@ class AdjudicateRequest(BaseModel):
     stream_b: StreamIn
     offset_min: int = Field(..., ge=-OFFSET_BOUND, le=OFFSET_BOUND)
     offset_max: int = Field(..., ge=-OFFSET_BOUND, le=OFFSET_BOUND)
-    jump: int = Field(..., ge=1, le=JUMP_MAX)
+    # 静态 / 一次跳变模式（默认）必填固定跳变量；缓变校时模式下忽略。
+    jump: Optional[int] = Field(None, ge=1, le=JUMP_MAX)
     min_hits: int = Field(..., ge=1, le=MIN_HITS_MAX)
+    # 缓变校时（漂移）模式：启用后不再使用固定跳变量，改为限制每相邻
+    # 已匹配事件之间实际偏移的整数变化幅度。
+    drift_mode: bool = False
+    max_offset_change: Optional[int] = Field(None, ge=0, le=DRIFT_CHANGE_MAX)
 
     @model_validator(mode="after")
     def _check_ranges(self) -> "AdjudicateRequest":
         if self.offset_min > self.offset_max:
             raise ValueError("允许偏移范围下界不能大于上界")
+        if self.drift_mode:
+            if self.max_offset_change is None:
+                raise ValueError(
+                    "缓变校时模式必须提供 max_offset_change"
+                    "（每相邻已匹配事件允许的最大整数偏移变化）"
+                )
+        elif self.jump is None:
+            raise ValueError("静态 / 一次跳变模式必须提供固定跳变量 jump")
         return self
 
 
@@ -76,6 +90,24 @@ class SolutionOut(BaseModel):
     pairs: list[PairOut]
 
 
+class DriftPairOut(BaseModel):
+    index_a: int
+    index_b: int
+    time_a: int
+    time_b: int
+    code: str
+    offset: int  # 该对实际偏移 tA - tB
+    # 相对上一对的偏移变化（首对为 null），供工程师判断漂移是否连续。
+    offset_change: Optional[int]
+
+
+class DriftSolutionOut(BaseModel):
+    initial_offset: int
+    max_offset_change: int
+    matched_count: int
+    pairs: list[DriftPairOut]
+
+
 class AdjudicateResponse(BaseModel):
     status: Literal["optimal", "no_solution"]
     matched_count: int
@@ -83,5 +115,17 @@ class AdjudicateResponse(BaseModel):
     uniqueness: Optional[Literal["unique", "ambiguous"]]
     solution: Optional[SolutionOut]
     witness: Optional[SolutionOut]
+    reason: Optional[str]
+    diagnostics: dict
+
+
+class DriftAdjudicateResponse(BaseModel):
+    mode: Literal["drift"] = "drift"
+    status: Literal["optimal", "no_solution"]
+    matched_count: int
+    min_hits: int
+    uniqueness: Optional[Literal["unique", "ambiguous"]]
+    solution: Optional[DriftSolutionOut]
+    witness: Optional[DriftSolutionOut]
     reason: Optional[str]
     diagnostics: dict
